@@ -1,0 +1,9 @@
+.venv
+claude.md
+prompt.md
+__pycache__/
+*.pyc
+.env
+results/
+final_report/
+*.log

@@ -1,0 +1,20 @@
+settings:
+  jmx_template: templates/base_template.jmx
+  jmeter_path: jmeter # auto-detected: checks /opt/homebrew/bin/jmeter first, then PATH
+  thread_levels: [10, 15, 20, 25, 30, 35, 40, 45, 50]
+  loops_per_level: 20
+  api_interval_seconds: 30 # recovery time between APIs
+  model_provider: ollama # ollama | groq | gemini | anthropic
+  model_name: qwen3.5:9b # llama3 | mixtral-8x7b-32768 | gemini-1.5-flash | claude-3-haiku-20240307
+  report_title: API Stress Test Report # cover page title; also used to derive the output filename
+
+apis:
+  - name: dashboard
+    url: https://domain.com/dashboard
+    method: POST
+    headers:
+      Content-Type: application/json
+    body: |
+      {"user":123}
+
+
