@@ -4,8 +4,15 @@ Runs the three agents sequentially: runner_agent -> summariser_agent -> report_a
 Usage: python orchestrator.py
 """
 
-from agents import report_agent, runner_agent, summariser_agent
-from agents.common import load_config, setup_logging
+from agents.common import get_run_id, load_config, setup_logging
+
+# Seed the correlation ID before importing the agent submodules below: each of
+# them calls setup_logging(__name__) at import time, which reads get_run_id()
+# to pick a per-run log directory. Seeding it first means all three agents'
+# log files land under the same logs/{run_id}/ directory for this execution.
+get_run_id()
+
+from agents import report_agent, runner_agent, summariser_agent  # noqa: E402
 
 logger = setup_logging(__name__)
 

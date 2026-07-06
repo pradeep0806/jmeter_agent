@@ -1,5 +1,6 @@
 """Agent 3: reads all per-API markdown summaries and writes the final consolidated .docx report."""
 
+import json
 import re
 import sys
 from datetime import date
@@ -12,6 +13,7 @@ if __name__ == "__main__" and __package__ is None:
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt, RGBColor
+from pydantic import BaseModel, ValidationError
 
 from agents.common import PROJECT_ROOT, get_llm, setup_logging
 
@@ -29,16 +31,40 @@ BODY_SIZE = Pt(11)
 HEADING_SIZE = Pt(14)
 
 EXEC_SUMMARY_PROMPT = """You are a performance engineering lead writing an executive summary \
-for a stress test report covering {count} APIs.
+for a stress test report covering {count} APIs. Respond with ONLY a JSON object matching \
+exactly this schema (no markdown fences, no extra text):
+
+{{"summary": "<2-3 sentence overview comparing overall resilience across the APIs>", \
+"most_resilient_api": "<name of the API that held up best under load>", \
+"most_fragile_api": "<name of the API that degraded earliest>", \
+"overall_recommendation": "<one sentence overall system recommendation>"}}
 
 Per-API summary (name, safe limit, breaking point, max error %):
 {overview}
-
-Write a short executive summary (2-3 paragraphs, plain prose, no markdown headings) that:
-1. Compares overall resilience across the APIs.
-2. Identifies which API is the most resilient and which is the most fragile.
-3. Gives an overall system recommendation.
 """
+
+
+class ExecutiveSummary(BaseModel):
+    """Schema-validated LLM output for the report's executive summary."""
+
+    summary: str
+    most_resilient_api: str
+    most_fragile_api: str
+    overall_recommendation: str
+
+
+def _strip_code_fences(text: str) -> str:
+    """Strip a leading/trailing ```json ... ``` fence from an LLM response, if present.
+
+    Args:
+        text: Raw LLM response text.
+
+    Returns:
+        Text with any surrounding markdown code fence removed.
+    """
+    stripped = text.strip()
+    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.DOTALL)
+    return match.group(1) if match else stripped
 
 
 def _status_color(status: str) -> RGBColor:
@@ -64,19 +90,23 @@ def parse_summary_md(md_text: str) -> dict[str, Any]:
         md_text: Full contents of a results/summaries/{api_name}.md file.
 
     Returns:
-        Dict with name, url, method, test_date, rows, key_findings, safe_limit,
-        breaking_point, breaking_pct, and recommendation.
+        Dict with name, url, method, test_date, verdict, rows, regression_flags,
+        bottleneck_hypothesis, safe_limit, breaking_point, breaking_pct, and recommendation.
     """
     name_match = re.search(r"^# API Stress Test Summary: (.+)$", md_text, re.MULTILINE)
     url_match = re.search(r"\*\*URL:\*\* (.+)", md_text)
     method_match = re.search(r"\*\*Method:\*\* (.+)", md_text)
     date_match = re.search(r"\*\*Test Date:\*\* (.+)", md_text)
+    verdict_match = re.search(r"\*\*Verdict:\*\* (.+)", md_text)
     safe_match = re.search(r"\*\*Safe limit:\*\* (\S+)", md_text)
     breaking_match = re.search(
-        r"\*\*Breaking point:\*\* (\S+) concurrent users \(([^)]+)\)", md_text
+        r"\*\*Breaking point:\*\* (\S+) concurrent users \(([\d.]+%|N/A)", md_text
     )
-    findings_match = re.search(
-        r"## Key Findings\n\n(.+?)\n\n## Breaking Point", md_text, re.DOTALL
+    regression_match = re.search(
+        r"## Regression vs Previous Run\n\n(.+?)\n\n## Bottleneck Hypothesis", md_text, re.DOTALL
+    )
+    bottleneck_match = re.search(
+        r"## Bottleneck Hypothesis\n\n(.+?)\n\n## Breaking Point", md_text, re.DOTALL
     )
     recommendation_match = re.search(
         r"## Recommendation\n\n(.+?)\s*$", md_text, re.DOTALL
@@ -90,7 +120,7 @@ def parse_summary_md(md_text: str) -> dict[str, Any]:
             and "Threads" not in line
         ):
             cells = [c.strip() for c in line.strip("|").split("|")]
-            if len(cells) == 7 and cells[0].isdigit():
+            if len(cells) == 10 and cells[0].isdigit():
                 rows.append(
                     {
                         "threads": cells[0],
@@ -98,18 +128,30 @@ def parse_summary_md(md_text: str) -> dict[str, Any]:
                         "avg": cells[2],
                         "min": cells[3],
                         "max": cells[4],
-                        "error_pct": cells[5],
-                        "status": cells[6],
+                        "p95": cells[5],
+                        "p99": cells[6],
+                        "throughput": cells[7],
+                        "error_pct": cells[8],
+                        "status": cells[9],
                     }
                 )
+
+    regression_text = regression_match.group(1).strip() if regression_match else ""
+    regression_flags = (
+        [line.lstrip("- ").strip() for line in regression_text.splitlines() if line.strip().startswith("-")]
+        if regression_text
+        else []
+    )
 
     return {
         "name": name_match.group(1).strip() if name_match else "unknown",
         "url": url_match.group(1).strip() if url_match else "",
         "method": method_match.group(1).strip() if method_match else "",
         "test_date": date_match.group(1).strip() if date_match else "",
+        "verdict": verdict_match.group(1).strip() if verdict_match else "unknown",
         "rows": rows,
-        "key_findings": findings_match.group(1).strip() if findings_match else "",
+        "regression_flags": regression_flags,
+        "bottleneck_hypothesis": bottleneck_match.group(1).strip() if bottleneck_match else "",
         "safe_limit": safe_match.group(1).strip() if safe_match else "N/A",
         "breaking_point": (
             breaking_match.group(1).strip() if breaking_match else "Not reached"
@@ -198,17 +240,42 @@ def _overall_status(max_error_pct: float) -> str:
     return "Critical"
 
 
-def generate_executive_summary(
-    config: dict[str, Any], summaries: list[dict[str, Any]]
-) -> str:
-    """Ask the configured LLM for an executive summary, falling back to a template on failure.
+def _fallback_executive_summary(summaries: list[dict[str, Any]]) -> dict[str, str]:
+    """Produce a template-based (non-LLM) executive summary.
+
+    Args:
+        summaries: List of parsed per-API summary dicts.
+
+    Returns:
+        Dict with "summary", "most_resilient_api", "most_fragile_api", "overall_recommendation".
+    """
+    ranked = sorted(summaries, key=_max_error_pct)
+    most_resilient = ranked[0]["name"] if ranked else "N/A"
+    most_fragile = ranked[-1]["name"] if ranked else "N/A"
+    return {
+        "summary": (
+            f"This report covers {len(summaries)} APIs tested under staircase load. "
+            f"{most_resilient} showed the strongest resilience under load, while {most_fragile} "
+            f"degraded earliest."
+        ),
+        "most_resilient_api": most_resilient,
+        "most_fragile_api": most_fragile,
+        "overall_recommendation": (
+            "Cap production concurrency at each API's individually determined safe limit, "
+            "with the most fragile services prioritised for remediation."
+        ),
+    }
+
+
+def generate_executive_summary(config: dict[str, Any], summaries: list[dict[str, Any]]) -> dict[str, str]:
+    """Ask the configured LLM for a schema-validated executive summary, falling back to a template.
 
     Args:
         config: Parsed config.yaml dictionary.
         summaries: List of parsed per-API summary dicts.
 
     Returns:
-        Executive summary text (plain prose).
+        Dict with "summary", "most_resilient_api", "most_fragile_api", "overall_recommendation".
     """
     overview_lines = []
     for s in summaries:
@@ -223,28 +290,14 @@ def generate_executive_summary(
         prompt = EXEC_SUMMARY_PROMPT.format(count=len(summaries), overview=overview)
         response = llm.invoke(prompt)
         text = response.content if hasattr(response, "content") else str(response)
-        if text.strip():
-            return text.strip()
-        logger.warning(
-            "LLM returned an empty executive summary, using template fallback"
-        )
-    except (
-        Exception
-    ) as exc:  # noqa: BLE001 - any LLM failure must fall back, never crash
-        logger.warning(
-            "Executive summary LLM call failed: %s — using template fallback", exc
-        )
+        parsed = ExecutiveSummary.model_validate_json(_strip_code_fences(text))
+        return parsed.model_dump()
+    except (ValidationError, json.JSONDecodeError) as exc:
+        logger.warning("Executive summary failed schema validation: %s — using template fallback", exc)
+    except Exception as exc:  # noqa: BLE001 - any LLM failure must fall back, never crash
+        logger.warning("Executive summary LLM call failed: %s — using template fallback", exc)
 
-    ranked = sorted(summaries, key=_max_error_pct)
-    most_resilient = ranked[0]["name"] if ranked else "N/A"
-    most_fragile = ranked[-1]["name"] if ranked else "N/A"
-    return (
-        f"This report covers {len(summaries)} APIs tested under staircase load. "
-        f"{most_resilient} showed the strongest resilience under load, while {most_fragile} "
-        f"degraded earliest. Overall, production concurrency should be capped at each API's "
-        f"individually determined safe limit, with the most fragile services prioritised for "
-        f"remediation."
-    )
+    return _fallback_executive_summary(summaries)
 
 
 def _set_body_style(document: Document) -> None:
@@ -277,9 +330,10 @@ def _add_results_table(document: Document, rows: list[dict[str, str]]) -> None:
 
     Args:
         document: The python-docx Document to append to.
-        rows: Parsed table rows (threads, requests, avg, min, max, error_pct, status).
+        rows: Parsed table rows (threads, requests, avg, min, max, p95, p99, throughput,
+            error_pct, status).
     """
-    table = document.add_table(rows=1, cols=7)
+    table = document.add_table(rows=1, cols=10)
     table.style = "Light Grid Accent 1"
     headers = [
         "Threads",
@@ -287,6 +341,9 @@ def _add_results_table(document: Document, rows: list[dict[str, str]]) -> None:
         "Avg (ms)",
         "Min (ms)",
         "Max (ms)",
+        "P95 (ms)",
+        "P99 (ms)",
+        "Throughput (rps)",
         "Error %",
         "Status",
     ]
@@ -301,6 +358,9 @@ def _add_results_table(document: Document, rows: list[dict[str, str]]) -> None:
             row["avg"],
             row["min"],
             row["max"],
+            row["p95"],
+            row["p99"],
+            row["throughput"],
             row["error_pct"],
             row["status"],
         ]
@@ -361,8 +421,12 @@ def build_report(config: dict[str, Any], summaries: list[dict[str, Any]]) -> Doc
     document.add_page_break()
 
     # Executive summary
+    exec_summary = generate_executive_summary(config, summaries)
     _add_heading(document, "Executive Summary", level=1)
-    document.add_paragraph(generate_executive_summary(config, summaries))
+    document.add_paragraph(exec_summary["summary"])
+    document.add_paragraph(f"Most resilient: {exec_summary['most_resilient_api']}")
+    document.add_paragraph(f"Most fragile: {exec_summary['most_fragile_api']}")
+    document.add_paragraph(f"Overall recommendation: {exec_summary['overall_recommendation']}")
     document.add_page_break()
 
     # Per-API sections
@@ -371,12 +435,20 @@ def build_report(config: dict[str, Any], summaries: list[dict[str, Any]]) -> Doc
         document.add_paragraph(f"URL: {s['url']}")
         document.add_paragraph(f"Method: {s['method']}")
         document.add_paragraph(f"Test Date: {s['test_date']}")
+        document.add_paragraph(f"Verdict: {s['verdict']}")
 
         _add_heading(document, "Results", level=2)
         _add_results_table(document, s["rows"])
 
-        _add_heading(document, "Key Findings", level=2)
-        document.add_paragraph(s["key_findings"])
+        _add_heading(document, "Regression vs Previous Run", level=2)
+        if s["regression_flags"]:
+            for flag in s["regression_flags"]:
+                document.add_paragraph(flag, style="List Bullet")
+        else:
+            document.add_paragraph("No regressions detected vs the previous run.")
+
+        _add_heading(document, "Bottleneck Hypothesis", level=2)
+        document.add_paragraph(s["bottleneck_hypothesis"])
 
         _add_heading(document, "Breaking Point", level=2)
         document.add_paragraph(f"Safe limit: {s['safe_limit']} concurrent users")

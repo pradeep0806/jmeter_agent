@@ -58,6 +58,7 @@
           </HeaderManager>
           <hashTree/>
         </hashTree>
+{{BACKEND_LISTENER}}
       </hashTree>
     </hashTree>
   </hashTree>

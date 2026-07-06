@@ -1,0 +1,50 @@
+{
+  "title": "JMeter Staircase — Live View",
+  "uid": "jmeter-staircase",
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "JMeter Exporter Reachable",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [{ "expr": "up{job=\"jmeter\"}", "legendFormat": "up" }],
+      "description": "1 while a JMeter thread-level run is active and its Prometheus exporter is up; 0 between levels — expected, since each staircase level is a fresh JMeter process."
+    },
+    {
+      "id": 2,
+      "title": "Response Latency (adjust to your plugin's metric name)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        { "expr": "jmeter_response_latency_over_time_seconds{job=\"jmeter\"}", "legendFormat": "{{transaction}}" }
+      ],
+      "description": "Starter query against jmeter-prometheus-plugin's latency metric. Check http://localhost:9270/metrics (or the app container's port) during a run and adjust the metric name/labels to match your installed plugin version."
+    },
+    {
+      "id": 3,
+      "title": "Error Responses (adjust to your plugin's metric name)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        { "expr": "sum by (code) (rate(jmeter_responses_total{job=\"jmeter\"}[1m]))", "legendFormat": "{{code}}" }
+      ],
+      "description": "Starter query against jmeter-prometheus-plugin's response-count metric; adjust to match your installed plugin version."
+    },
+    {
+      "id": 4,
+      "title": "Pipeline Logs",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "loki", "uid": "Loki" },
+      "targets": [{ "expr": "{job=\"jmeter_agent\"}" }]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

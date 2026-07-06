@@ -1,0 +1,78 @@
+services:
+  # ── Stress test pipeline (one-shot job: `docker compose run --rm app`) ──────
+  app:
+    build: .
+    env_file: .env
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      # Ollama runs on the host machine, not in this compose network
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    depends_on:
+      - mlflow
+      - loki
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./results:/app/results
+      - ./final_report:/app/final_report
+      - ./logs:/app/logs
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # Linux compatibility
+
+  # ── Run history / regression store ──────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    ports:
+      - "5000:5000"
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db
+    volumes:
+      - mlflow_data:/mlflow
+
+  # ── Metrics Collection ───────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+
+  # ── Log Aggregation ──────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability:/etc/loki
+      - loki_data:/loki
+    command: -config.file=/etc/loki/loki-config.yml
+
+  # ── Dashboards ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards
+    depends_on:
+      - prometheus
+      - loki
+
+volumes:
+  mlflow_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:

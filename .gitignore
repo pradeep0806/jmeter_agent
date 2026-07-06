@@ -7,3 +7,5 @@ __pycache__/
 results/
 final_report/
 *.log
+logs/
+mlruns/

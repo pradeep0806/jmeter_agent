@@ -7,6 +7,12 @@ settings:
   model_provider: ollama # ollama | groq | gemini | anthropic
   model_name: qwen3.5:9b # llama3 | mixtral-8x7b-32768 | gemini-1.5-flash | claude-3-haiku-20240307
   report_title: API Stress Test Report # cover page title; also used to derive the output filename
+  breaking_point_error_pct: 5.0 # error % above which a thread level counts as the breaking point
+  early_stop_p95_ms: null # optional p95 latency (ms) that also triggers an early stop; null disables
+  regression_threshold_pct: 20.0 # % degradation vs previous MLflow run that gets flagged
+  mlflow_tracking_uri: null # null -> MLflow default (./mlruns); overridden by MLFLOW_TRACKING_URI env var
+  prometheus_enabled: true # add a Prometheus BackendListener to generated .jmx files
+  prometheus_port: 9270 # port JMeter's Prometheus exporter listens on during a run
 
 apis:
   - name: dashboard

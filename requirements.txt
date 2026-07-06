@@ -7,3 +7,5 @@ langchain-anthropic
 python-docx
 pyyaml
 requests
+pydantic
+mlflow

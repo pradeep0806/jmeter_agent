@@ -13,7 +13,13 @@ if __name__ == "__main__" and __package__ is None:
 
 from langchain_core.tools import tool
 
-from agents.common import PROJECT_ROOT, get_jmeter_path, load_config, setup_logging
+from agents.common import (
+    PROJECT_ROOT,
+    get_jmeter_path,
+    load_config,
+    read_thread_level_stats,
+    setup_logging,
+)
 
 logger = setup_logging(__name__)
 
@@ -59,17 +65,57 @@ def _escape_xml(value: str) -> str:
     )
 
 
-def generate_jmx(api_config: dict[str, Any], template_path: Path, output_path: Path) -> None:
+def _build_backend_listener_xml(api_name: str, prometheus_port: int) -> str:
+    """Render the Prometheus BackendListener element for live metrics export.
+
+    Uses the jmeter-prometheus-plugin (johrstrom) backend, which exposes an
+    HTTP /metrics endpoint on prometheus_port for the duration of the test run.
+
+    Args:
+        api_name: Name of the API, attached as a label so Grafana can filter by it.
+        prometheus_port: Port the exporter listens on.
+
+    Returns:
+        XML string for a BackendListener element plus its (empty) hashTree.
+    """
+    return f"""      <BackendListener guiclass="BackendListenerGui" testclass="BackendListener" testname="Prometheus Listener" enabled="true">
+        <elementProp name="arguments" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
+          <collectionProp name="Arguments.arguments">
+            <elementProp name="PROMETHEUS_PORT" elementType="Argument">
+              <stringProp name="Argument.name">PROMETHEUS_PORT</stringProp>
+              <stringProp name="Argument.value">{prometheus_port}</stringProp>
+            </elementProp>
+            <elementProp name="TESTNAME" elementType="Argument">
+              <stringProp name="Argument.name">TESTNAME</stringProp>
+              <stringProp name="Argument.value">{_escape_xml(api_name)}</stringProp>
+            </elementProp>
+          </collectionProp>
+        </elementProp>
+        <stringProp name="classname">io.github.jmeter.prometheus.PrometheusListener</stringProp>
+      </BackendListener>
+      <hashTree/>"""
+
+
+def generate_jmx(
+    api_config: dict[str, Any],
+    template_path: Path,
+    output_path: Path,
+    settings: dict[str, Any] | None = None,
+) -> None:
     """Generate a .jmx file for one API by substituting placeholders in the template.
 
     Args:
         api_config: One API entry from config.yaml (name, url, method, headers, body).
         template_path: Path to templates/base_template.jmx.
         output_path: Path where the generated .jmx should be written.
+        settings: The "settings" block from config.yaml, used for the Prometheus
+            BackendListener (prometheus_enabled/prometheus_port). Defaults to disabled
+            if omitted.
 
     Raises:
         OSError: If the template cannot be read or the output cannot be written.
     """
+    settings = settings or {}
     parsed = urlparse(api_config["url"])
     protocol = parsed.scheme or "https"
     server_name = parsed.hostname or ""
@@ -84,6 +130,12 @@ def generate_jmx(api_config: dict[str, Any], template_path: Path, output_path: P
     with open(template_path, encoding="utf-8") as f:
         jmx_content = f.read()
 
+    backend_listener_xml = ""
+    if settings.get("prometheus_enabled", True):
+        backend_listener_xml = _build_backend_listener_xml(
+            api_config["name"], settings.get("prometheus_port", 9270)
+        )
+
     replacements = {
         "{{SERVER_NAME}}": _escape_xml(server_name),
         "{{PORT}}": port,
@@ -92,6 +144,7 @@ def generate_jmx(api_config: dict[str, Any], template_path: Path, output_path: P
         "{{METHOD}}": api_config.get("method", "GET"),
         "{{BODY}}": _escape_xml(body),
         "{{HEADERS_XML}}": _build_headers_xml(headers),
+        "{{BACKEND_LISTENER}}": backend_listener_xml,
     }
     for placeholder, value in replacements.items():
         jmx_content = jmx_content.replace(placeholder, value)
@@ -141,6 +194,8 @@ def run_jmeter_test(
         f'-l "{jtl_path}" '
         f'-e -o "{report_dir}"'
     )
+
+    logger.info("Executing JMeter command: %s", command)
 
     try:
         result = subprocess.run(
@@ -192,13 +247,15 @@ def run_staircase_for_api(api_config: dict[str, Any], settings: dict[str, Any]) 
     jmx_path = PROJECT_ROOT / "results" / f"{api_name}.jmx"
 
     try:
-        generate_jmx(api_config, template_path, jmx_path)
+        generate_jmx(api_config, template_path, jmx_path, settings)
     except OSError as exc:
         logger.error("Could not generate .jmx for %s: %s", api_name, exc)
         return
 
     thread_levels: list[int] = settings["thread_levels"]
     loops: int = settings["loops_per_level"]
+    breaking_point_error_pct: float = settings.get("breaking_point_error_pct", 5.0)
+    early_stop_p95_ms: float | None = settings.get("early_stop_p95_ms")
 
     for threads in thread_levels:
         logger.info("Testing API %s — threads %s", api_name, threads)
@@ -220,6 +277,23 @@ def run_staircase_for_api(api_config: dict[str, Any], settings: dict[str, Any]) 
                 "Skipping thread level %s for %s due to JMeter failure", threads, api_name
             )
             continue
+
+        stats = read_thread_level_stats(REPORTS_DIR, api_name, threads)
+        if stats is None:
+            continue
+
+        error_breach = stats["errorPct"] > breaking_point_error_pct
+        latency_breach = early_stop_p95_ms is not None and stats["p95"] > early_stop_p95_ms
+        if error_breach or latency_breach:
+            logger.info(
+                "API %s saturates at ~%s concurrent threads (error=%.2f%%, p95=%.0fms) — "
+                "stopping staircase early",
+                api_name,
+                threads,
+                stats["errorPct"],
+                stats["p95"],
+            )
+            break
 
 
 def main() -> None:
