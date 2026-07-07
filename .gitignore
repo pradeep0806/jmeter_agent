@@ -9,3 +9,5 @@ final_report/
 *.log
 logs/
 mlruns/
+mlflow.db
+config.yaml

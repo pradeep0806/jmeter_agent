@@ -9,12 +9,18 @@ this must never crash the pipeline.
 
 import os
 from typing import Any
-
+import mlflow
 from agents.common import setup_logging
 
 logger = setup_logging(__name__)
 
-METRIC_NAMES: tuple[str, ...] = ("error_pct", "mean_res_time", "p95", "p99", "throughput")
+METRIC_NAMES: tuple[str, ...] = (
+    "error_pct",
+    "mean_res_time",
+    "p95",
+    "p99",
+    "throughput",
+)
 
 
 def _row_metric_value(row: dict[str, Any], metric: str) -> float:
@@ -43,14 +49,17 @@ def _configure_tracking_uri(config: dict[str, Any]) -> None:
     Args:
         config: Parsed config.yaml dictionary.
     """
-    import mlflow
 
-    tracking_uri = os.getenv("MLFLOW_TRACKING_URI") or config["settings"].get("mlflow_tracking_uri")
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI") or config["settings"].get(
+        "mlflow_tracking_uri"
+    )
     if tracking_uri:
         mlflow.set_tracking_uri(tracking_uri)
 
 
-def log_run_metrics(config: dict[str, Any], api_name: str, run_id: str, rows: list[dict[str, Any]]) -> None:
+def log_run_metrics(
+    config: dict[str, Any], api_name: str, run_id: str, rows: list[dict[str, Any]]
+) -> None:
     """Log one API's per-thread-level staircase metrics to MLflow as a single run.
 
     Args:
@@ -68,13 +77,19 @@ def log_run_metrics(config: dict[str, Any], api_name: str, run_id: str, rows: li
             mlflow.set_tag("run_id", run_id)
             for row in rows:
                 for metric in METRIC_NAMES:
-                    mlflow.log_metric(metric, _row_metric_value(row, metric), step=row["threads"])
+                    mlflow.log_metric(
+                        metric, _row_metric_value(row, metric), step=row["threads"]
+                    )
         logger.info("Logged %s thread levels for %s to MLflow", len(rows), api_name)
-    except Exception as exc:  # noqa: BLE001 - MLflow being unreachable must not crash the pipeline
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 - MLflow being unreachable must not crash the pipeline
         logger.warning("Could not log metrics to MLflow for %s: %s", api_name, exc)
 
 
-def get_previous_run_metrics(config: dict[str, Any], api_name: str, current_run_id: str) -> dict[int, dict[str, float]] | None:
+def get_previous_run_metrics(
+    config: dict[str, Any], api_name: str, current_run_id: str
+) -> dict[int, dict[str, float]] | None:
     """Fetch the most recent completed MLflow run for an API, excluding the current run.
 
     Args:
@@ -101,7 +116,9 @@ def get_previous_run_metrics(config: dict[str, Any], api_name: str, current_run_
             order_by=["start_time DESC"],
             max_results=10,
         )
-        previous_run = next((r for r in runs if r.data.tags.get("run_id") != current_run_id), None)
+        previous_run = next(
+            (r for r in runs if r.data.tags.get("run_id") != current_run_id), None
+        )
         if previous_run is None:
             return None
 
@@ -110,7 +127,9 @@ def get_previous_run_metrics(config: dict[str, Any], api_name: str, current_run_
             for point in client.get_metric_history(previous_run.info.run_id, metric):
                 history.setdefault(point.step, {})[metric] = point.value
         return history
-    except Exception as exc:  # noqa: BLE001 - MLflow being unreachable must not crash the pipeline
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 - MLflow being unreachable must not crash the pipeline
         logger.warning("Could not fetch previous MLflow run for %s: %s", api_name, exc)
         return None
 
@@ -152,7 +171,9 @@ def detect_regressions(
 
         prev_throughput = previous.get("throughput", 0.0)
         if prev_throughput > 0:
-            throughput_change_pct = (prev_throughput - row["throughput"]) / prev_throughput * 100
+            throughput_change_pct = (
+                (prev_throughput - row["throughput"]) / prev_throughput * 100
+            )
             if throughput_change_pct > threshold_pct:
                 flags.append(
                     f"throughput at {threads} threads dropped {throughput_change_pct:.0f}% vs last run "
