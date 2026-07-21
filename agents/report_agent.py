@@ -163,8 +163,14 @@ def parse_summary_md(md_text: str) -> dict[str, Any]:
     }
 
 
-def load_all_summaries() -> list[dict[str, Any]]:
-    """Load and parse every markdown summary file in results/summaries/.
+def load_all_summaries(api_names: set[str] | None = None) -> list[dict[str, Any]]:
+    """Load and parse markdown summary files in results/summaries/.
+
+    Args:
+        api_names: If given, only summaries whose parsed name is in this set are
+            included — filters out stale files left over from APIs that were
+            renamed or removed from config.yaml in a later run. If None, every
+            .md file present is included (legacy behavior).
 
     Returns:
         List of parsed summary dicts, one per API, in filename-sorted order.
@@ -175,9 +181,18 @@ def load_all_summaries() -> list[dict[str, Any]]:
     for md_path in sorted(SUMMARIES_DIR.glob("*.md")):
         try:
             with open(md_path, encoding="utf-8") as f:
-                summaries.append(parse_summary_md(f.read()))
+                parsed = parse_summary_md(f.read())
         except OSError as exc:
             logger.warning("Could not read summary %s: %s", md_path, exc)
+            continue
+
+        if api_names is not None and parsed["name"] not in api_names:
+            logger.info(
+                "Skipping stale summary %s (API not in current config.yaml)", md_path.name
+            )
+            continue
+
+        summaries.append(parsed)
     return summaries
 
 
@@ -494,7 +509,8 @@ def main() -> None:
     from agents.common import load_config
 
     config = load_config()
-    summaries = load_all_summaries()
+    configured_api_names = {api["name"] for api in config["apis"]}
+    summaries = load_all_summaries(configured_api_names)
 
     if not summaries:
         logger.warning(

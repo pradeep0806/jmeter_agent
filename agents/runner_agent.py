@@ -1,5 +1,6 @@
 """Agent 1: generates .jmx test plans from the template and runs JMeter staircase tests."""
 
+import json
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,92 @@ def _build_headers_xml(headers: dict[str, str]) -> str:
             "              </elementProp>"
         )
     return "\n".join(entries)
+
+
+def _dict_to_xml_element(tag: str, value: Any) -> str:
+    """Recursively render one YAML value as an XML element for the "xml" body_type.
+
+    Dicts become nested elements, lists become repeated sibling elements using
+    the same tag, and scalars become element text content. Attributes are not
+    supported — use body_type "raw" with a hand-written XML string if the
+    target API requires XML attributes.
+
+    Args:
+        tag: Element name for this value.
+        value: The value to render (dict, list, or scalar).
+
+    Returns:
+        XML string for this element (and its children).
+    """
+    if isinstance(value, dict):
+        inner = "".join(_dict_to_xml_element(k, v) for k, v in value.items())
+        return f"<{tag}>{inner}</{tag}>"
+    if isinstance(value, list):
+        return "".join(_dict_to_xml_element(tag, item) for item in value)
+    text = "" if value is None else str(value)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<{tag}>{text}</{tag}>"
+
+
+def _dict_to_xml(body: dict[str, Any], root_tag: str) -> str:
+    """Serialize a YAML mapping into an XML document for the "xml" body_type.
+
+    Args:
+        body: The API's "body" mapping from config.yaml.
+        root_tag: Name of the root element wrapping the serialized fields.
+
+    Returns:
+        A complete XML document string, including the XML declaration.
+    """
+    inner = "".join(_dict_to_xml_element(k, v) for k, v in body.items())
+    return f'<?xml version="1.0" encoding="UTF-8"?><{root_tag}>{inner}</{root_tag}>'
+
+
+def _serialize_body(api_config: dict[str, Any]) -> str:
+    """Turn an API's config.yaml body into the literal string sent as the request body.
+
+    Behavior is controlled by the optional "body_type" field on the API entry:
+      - "raw" (default when body is a string): body is used exactly as written.
+      - "json": body must be a YAML mapping/list; serialized with json.dumps so
+        it's always valid JSON instead of hand-typed/escaped JSON text.
+      - "xml": body must be a YAML mapping; serialized into an XML document
+        (see _dict_to_xml). Root element name comes from "xml_root_tag", or
+        the API's "name" if that's not set.
+    If body_type is omitted and body is a YAML mapping/list, it's treated as
+    "json" for backward compatibility with configs written before body_type existed.
+
+    Args:
+        api_config: One API entry from config.yaml (name, url, method, headers,
+            body, and optionally body_type/xml_root_tag).
+
+    Returns:
+        The request body as a string.
+
+    Raises:
+        ValueError: If body_type is "xml" but body isn't a YAML mapping, or
+            body_type is an unrecognized value.
+    """
+    body = api_config.get("body")
+    body_type = api_config.get("body_type") or ("json" if isinstance(body, (dict, list)) else "raw")
+
+    if body is None:
+        return ""
+
+    if body_type == "raw":
+        return str(body)
+
+    if body_type == "json":
+        return json.dumps(body)
+
+    if body_type == "xml":
+        if not isinstance(body, dict):
+            raise ValueError(
+                f"API '{api_config.get('name')}': body_type 'xml' requires body to be a YAML mapping"
+            )
+        root_tag = api_config.get("xml_root_tag") or api_config.get("name", "root")
+        return _dict_to_xml(body, root_tag)
+
+    raise ValueError(f"API '{api_config.get('name')}': unsupported body_type '{body_type}'")
 
 
 def _escape_xml(value: str) -> str:
@@ -125,7 +212,7 @@ def generate_jmx(
         path = f"{path}?{parsed.query}"
 
     headers: dict[str, str] = api_config.get("headers") or {}
-    body: str = api_config.get("body") or ""
+    body: str = _serialize_body(api_config)
 
     with open(template_path, encoding="utf-8") as f:
         jmx_content = f.read()
